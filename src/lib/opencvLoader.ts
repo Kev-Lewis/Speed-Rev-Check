@@ -26,7 +26,7 @@ declare global {
 let readyPromise: Promise<{ cv: any }> | null = null;
 
 export function loadOpenCV(
-  src = "https://docs.opencv.org/4.11.0/opencv.js", // if this 404s, try 4.10.0 or 4.8.0
+  src = "https://docs.opencv.org/4.x/opencv.js", // verify this loads in a browser tab; try 4.10.0 or 4.5.0 if it 404s
   timeoutMs = 60000
 ): Promise<{ cv: any }> {
   if (typeof window !== "undefined" && window.cv && window.cv.Mat) {

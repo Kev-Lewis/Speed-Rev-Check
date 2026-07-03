@@ -1,136 +1,47 @@
 import { useRef, useState } from "react";
 import { extractFramesWebCodecs, isWebCodecsSupported } from "./lib/videoFramesWebCodecs";
 import { extractFrames } from "./lib/videoFrames";
-import { loadOpenCV } from "./lib/opencvLoader";
-import { BallTracker, type Point } from "./lib/ballTracker";
-
-type Phase = "idle" | "calibrating" | "ready" | "tracking" | "done";
+import { loadYolo, detect, COCO_SPORTS_BALL } from "./lib/yoloDetector";
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const previewRef = useRef<HTMLCanvasElement | null>(null); // offscreen copy of the preview frame
-  const [phase, setPhase] = useState<Phase>("idle");
-  const [points, setPoints] = useState<Point[]>([]);
-  const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState("");
   const [summary, setSummary] = useState("");
-
-  const CORNER_LABELS = ["foul line — left", "foul line — right", "pins — right", "pins — left"];
+  const [busy, setBusy] = useState(false);
 
   async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const f = e.target.files?.[0];
-    e.target.value = ""; // allow re-selecting the same file
-    if (!f) return;
-    setFile(f);
-    setPoints([]);
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setBusy(true);
     setSummary("");
-    setStatus("Loading preview…");
 
+    setStatus("Loading YOLO model (first time downloads the model + wasm)…");
+    console.log("[app] loading YOLO…");
     try {
-      const url = URL.createObjectURL(f);
-      const video = document.createElement("video");
-      video.src = url;
-      video.muted = true;
-      video.playsInline = true;
-      await new Promise<void>((res, rej) => {
-        video.onloadeddata = () => res();
-        video.onerror = () => rej(new Error("Could not load video for preview."));
-      });
-      video.currentTime = Math.min(1.2, (video.duration || 3) / 2); // a frame where the lane is visible
-      await new Promise<void>((res) => {
-        video.onseeked = () => res();
-      });
-
-      const display = canvasRef.current!;
-      display.width = video.videoWidth;
-      display.height = video.videoHeight;
-      display.getContext("2d")!.drawImage(video, 0, 0);
-
-      const pv = document.createElement("canvas");
-      pv.width = display.width;
-      pv.height = display.height;
-      pv.getContext("2d")!.drawImage(display, 0, 0);
-      previewRef.current = pv;
-      URL.revokeObjectURL(url);
-
-      setPhase("calibrating");
-      setStatus(`Click the 4 lane corners in order: ${CORNER_LABELS.join(" → ")}.`);
+      await loadYolo();
+      console.log("[app] YOLO ready");
     } catch (err) {
-      setStatus(`Preview failed: ${(err as Error).message}`);
-      setPhase("idle");
-    }
-  }
-
-  function redrawCalibration(pts: Point[]) {
-    const display = canvasRef.current;
-    const pv = previewRef.current;
-    if (!display || !pv) return;
-    const ctx = display.getContext("2d")!;
-    ctx.drawImage(pv, 0, 0);
-    ctx.fillStyle = "yellow";
-    ctx.strokeStyle = "yellow";
-    ctx.lineWidth = 2;
-    ctx.font = "16px monospace";
-    if (pts.length >= 2) {
-      ctx.beginPath();
-      pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
-      if (pts.length === 4) ctx.closePath();
-      ctx.stroke();
-    }
-    pts.forEach((p, i) => {
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, 6, 0, 2 * Math.PI);
-      ctx.fill();
-      ctx.fillText(String(i + 1), p.x + 9, p.y - 9);
-    });
-  }
-
-  function onCanvasClick(e: React.MouseEvent<HTMLCanvasElement>) {
-    if (phase !== "calibrating") return;
-    const display = canvasRef.current!;
-    const rect = display.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (display.width / rect.width);
-    const y = (e.clientY - rect.top) * (display.height / rect.height);
-    const next = [...points, { x, y }].slice(0, 4);
-    setPoints(next);
-    redrawCalibration(next);
-    if (next.length === 4) {
-      setPhase("ready");
-      setStatus("Lane set. Click Start Tracking.");
-    } else {
-      setStatus(`Corner ${next.length + 1}: click ${CORNER_LABELS[next.length]}.`);
-    }
-  }
-
-  async function startTracking() {
-    if (!file || points.length !== 4) return;
-    setPhase("tracking");
-    setSummary("");
-    setStatus("Loading OpenCV…");
-
-    let cv: any;
-    try {
-      const r = await loadOpenCV();
-      cv = r.cv;
-    } catch (err) {
-      setStatus(`OpenCV load failed: ${(err as Error).message}`);
-      setPhase("ready");
+      console.error("[app] YOLO load failed:", err);
+      setStatus(`YOLO load failed: ${(err as Error).message}`);
+      setBusy(false);
       return;
     }
 
     const display = canvasRef.current!;
     const dctx = display.getContext("2d")!;
-    const tracker = new BallTracker(cv, { roi: points });
     const reader = isWebCodecsSupported() ? extractFramesWebCodecs : extractFrames;
-    let found = 0;
+
     let total = 0;
-    setStatus("Tracking…");
+    let ballFrames = 0;
+    let bestBall = 0; // best sports-ball score seen
+    const otherClasses = new Set<number>();
+    setStatus("Detecting… (wasm inference is slow, ~minute for the clip)");
 
     try {
-      const report = await reader(file, async (frame) => {
+      await reader(file, async (frame) => {
         total++;
-        const det = tracker.processFrame(frame.canvas, frame.mediaTime, frame.index);
-        if (det) found++;
+        const dets = await detect(frame.canvas, 0.25);
 
         if (display.width !== frame.width) {
           display.width = frame.width;
@@ -138,46 +49,43 @@ export default function App() {
         }
         dctx.drawImage(frame.canvas, 0, 0);
 
-        // lane outline
-        dctx.strokeStyle = "rgba(255,255,0,0.7)";
-        dctx.lineWidth = 2;
-        dctx.beginPath();
-        points.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
-        dctx.closePath();
-        dctx.stroke();
-
-        // trajectory
-        if (tracker.path.length > 1) {
-          dctx.strokeStyle = "rgba(0,200,255,0.9)";
-          dctx.lineWidth = 2;
-          dctx.beginPath();
-          tracker.path.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
-          dctx.stroke();
+        let ballHere = false;
+        for (const d of dets) {
+          const isBall = d.classId === COCO_SPORTS_BALL;
+          if (isBall) {
+            ballHere = true;
+            bestBall = Math.max(bestBall, d.score);
+          } else {
+            otherClasses.add(d.classId);
+          }
+          dctx.strokeStyle = isBall ? "lime" : "rgba(180,180,180,0.8)";
+          dctx.lineWidth = isBall ? 3 : 1;
+          dctx.strokeRect(d.x, d.y, d.w, d.h);
+          dctx.fillStyle = dctx.strokeStyle;
+          dctx.font = "14px monospace";
+          dctx.fillText(`${isBall ? "ball" : "c" + d.classId} ${d.score.toFixed(2)}`, d.x, d.y - 4);
         }
-        // current detection
-        if (det) {
-          dctx.strokeStyle = "red";
-          dctx.lineWidth = 3;
-          dctx.beginPath();
-          dctx.arc(det.x, det.y, det.r + 3, 0, 2 * Math.PI);
-          dctx.stroke();
-        }
+        if (ballHere) ballFrames++;
 
-        if (total % 30 === 0) setStatus(`Tracking… ${total} frames, ball found in ${found}`);
-        await new Promise((res) => requestAnimationFrame(() => res(null)));
+        if (total % 10 === 0) {
+          console.log(`[app] frame ${total}, ball frames ${ballFrames}, bestBall ${bestBall.toFixed(2)}`);
+          setStatus(`Detecting… ${total} frames, ball in ${ballFrames}`);
+        }
+        await new Promise((r) => requestAnimationFrame(() => r(null)));
       });
 
-      tracker.dispose();
-      const pct = total ? Math.round((100 * found) / total) : 0;
+      const pct = total ? Math.round((100 * ballFrames) / total) : 0;
       setStatus("");
-      setPhase("done");
       setSummary(
-        `Done. Ball detected in ${found}/${total} frames (${pct}%). ${report.frameCount} frames @ ~${report.estimatedFps.toFixed(0)} fps.`
+        `Done. Sports-ball detected in ${ballFrames}/${total} frames (${pct}%), best score ${bestBall.toFixed(2)}. ` +
+          `Other classes seen: ${[...otherClasses].join(", ") || "none"}.`
       );
+      console.log("[app] done", { total, ballFrames, bestBall, otherClasses: [...otherClasses] });
     } catch (err) {
-      tracker.dispose();
+      console.error("[app] detection error:", err);
       setStatus(`Error: ${(err as Error).message}`);
-      setPhase("ready");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -185,28 +93,13 @@ export default function App() {
     <main style={{ fontFamily: "monospace", maxWidth: 640, margin: "3rem auto", padding: "0 1rem" }}>
       <h1>Speed-Rev-Check</h1>
       <p style={{ opacity: 0.7 }}>
-        Pick a clip, click the 4 lane corners (this sets the foul line and excludes the bowler), then track. Tune
-        detection in <code>ballTracker.ts</code>.
+        YOLO smoke test: green boxes are "sports ball" detections, gray are other classes. We're checking whether the
+        pretrained model sees your bowling ball before wiring it into tracking.
       </p>
-      <input type="file" accept="video/*" onChange={onFileChange} disabled={phase === "tracking"} />
-      {phase === "ready" && (
-        <button onClick={startTracking} style={{ marginLeft: 8 }}>
-          Start Tracking
-        </button>
-      )}
+      <input type="file" accept="video/*" onChange={onFileChange} disabled={busy} />
       <p style={{ minHeight: "1.2em" }}>{status}</p>
       {summary && <p>{summary}</p>}
-      <canvas
-        ref={canvasRef}
-        onClick={onCanvasClick}
-        style={{
-          width: "100%",
-          maxWidth: 480,
-          border: "1px solid #333",
-          borderRadius: 6,
-          cursor: phase === "calibrating" ? "crosshair" : "default",
-        }}
-      />
+      <canvas ref={canvasRef} style={{ width: "100%", maxWidth: 480, border: "1px solid #333", borderRadius: 6 }} />
     </main>
   );
 }

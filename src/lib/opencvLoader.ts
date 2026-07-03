@@ -1,84 +1,59 @@
 /*
  * opencvLoader.ts
  * ==================
- * Loads OpenCV.js once and resolves when the wasm runtime is truly ready.
+ * Loads OpenCV.js via the @techstark/opencv-js npm package (the docs single-file
+ * build with the wasm EMBEDDED). No <script> tag, no self-hosted /opencv.js, no
+ * CDN — so nothing for a browser extension to block and no wasm path issues.
  *
- * Why polling: depending on build/timing, `script.onload` can fire either
- * before OR after the wasm runtime finishes initializing, and the
- * `onRuntimeInitialized` callback may have already fired by the time we attach
- * it — which hangs the promise forever. So we set the callback AND poll for
- * `cv.Mat`, whichever wins first, with a hard timeout so it can never hang.
+ *   npm install @techstark/opencv-js
  *
- * Single-threaded docs.opencv.org build => no COOP/COEP headers needed (works
- * on GitHub Pages). For production, self-host opencv.js in /public and pass
- * "/opencv.js".
+ * The package is dynamically imported so its ~11 MB lands in its own lazy chunk,
+ * fetched only when tracking starts, keeping the initial page load fast.
+ *
+ * Resolution handles all three shapes the package can present: a Promise, an
+ * already-initialized module, or one that fires onRuntimeInitialized later.
+ * A poll + hard timeout guarantee it can never hang silently.
  */
 
-declare global {
-  interface Window {
-    cv?: any;
-  }
-}
+let readyPromise: Promise<any> | null = null;
 
-let loadingPromise: Promise<any> | null = null;
+export function loadOpenCV(timeoutMs = 60000): Promise<any> {
+  if (readyPromise) return readyPromise;
 
-export function loadOpenCV(
-  src = "/opencv.js", // self-hosted in /public — no third-party CDN for an extension to block
-  timeoutMs = 60000
-): Promise<any> {
-  if (typeof window !== "undefined" && window.cv && window.cv.Mat) return Promise.resolve(window.cv);
-  if (loadingPromise) return loadingPromise;
+  readyPromise = (async () => {
+    const mod: any = await import("@techstark/opencv-js");
+    const cv: any = mod.default ?? mod;
 
-  loadingPromise = new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (cv: any) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(poll);
-      clearTimeout(timer);
-      resolve(cv);
-    };
-    const fail = (msg: string) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(poll);
-      clearTimeout(timer);
-      loadingPromise = null; // let a later call retry
-      reject(new Error(msg));
-    };
+    // Case 1: package exports a Promise for the ready module
+    if (cv && typeof cv.then === "function") return await cv;
+    // Case 2: already initialized
+    if (cv && cv.Mat) return cv;
 
-    // 1) Poll for readiness — wins whenever the runtime becomes usable.
-    const poll = setInterval(() => {
-      if (window.cv && window.cv.Mat) done(window.cv);
-    }, 50);
-
-    // 2) Hard timeout so the tab can never sit hung.
-    const timer = setTimeout(() => fail(`OpenCV.js did not initialize within ${timeoutMs / 1000}s.`), timeoutMs);
-
-    // 3) Also hook the callback in case it fires (belt and suspenders).
-    const attachCallback = () => {
-      const cv = window.cv;
-      if (!cv) return;
-      if (cv.Mat) return done(cv);
-      cv.onRuntimeInitialized = () => done(window.cv);
-    };
-
-    const existing = document.querySelector<HTMLScriptElement>("script[data-opencv]");
-    if (existing) {
-      attachCallback();
-      existing.addEventListener("load", attachCallback);
-      existing.addEventListener("error", () => fail("OpenCV.js script failed to load."));
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = src;
-    script.async = true;
-    script.setAttribute("data-opencv", "true");
-    script.onload = attachCallback;
-    script.onerror = () => fail(`Failed to load OpenCV.js from ${src}`);
-    document.head.appendChild(script);
+    // Case 3: wait for the wasm runtime — poll + callback + timeout
+    return await new Promise<any>((resolve, reject) => {
+      let settled = false;
+      const finish = () => {
+        if (!settled && cv && cv.Mat) {
+          settled = true;
+          clearInterval(poll);
+          clearTimeout(timer);
+          resolve(cv);
+        }
+      };
+      const poll = setInterval(finish, 50);
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          clearInterval(poll);
+          reject(new Error(`OpenCV did not initialize within ${timeoutMs / 1000}s.`));
+        }
+      }, timeoutMs);
+      cv.onRuntimeInitialized = finish;
+    });
+  })().catch((e) => {
+    readyPromise = null; // allow a later retry
+    throw e;
   });
 
-  return loadingPromise;
+  return readyPromise;
 }

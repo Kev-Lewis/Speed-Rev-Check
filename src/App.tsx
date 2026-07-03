@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { extractFramesWebCodecs, isWebCodecsSupported } from "./lib/videoFramesWebCodecs";
 import { extractFrames } from "./lib/videoFrames";
-import { loadYolo, detect, COCO_SPORTS_BALL } from "./lib/yoloDetector";
+import { loadYolo, detect, BALL_CLASS_ID } from "./lib/yoloDetector";
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -51,7 +51,7 @@ export default function App() {
 
         let ballHere = false;
         for (const d of dets) {
-          const isBall = d.classId === COCO_SPORTS_BALL;
+          const isBall = d.classId === BALL_CLASS_ID;
           if (isBall) {
             ballHere = true;
             bestBall = Math.max(bestBall, d.score);

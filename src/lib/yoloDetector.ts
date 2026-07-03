@@ -5,7 +5,7 @@
  *
  * Everything self-hosted so nothing hits a CDN an extension could block:
  *   - ORT wasm files in /public/ort/   (wasmPaths -> "/ort/")
- *   - model in /public/models/yolov8n.onnx
+ *   - model in /public/models/best.onnx  (your trained single-class "ball" model)
  * Single-threaded (numThreads=1) because GitHub Pages can't send the COOP/COEP
  * headers wasm threads require.
  *
@@ -15,7 +15,7 @@
 
 import * as ort from "onnxruntime-web";
 
-export const COCO_SPORTS_BALL = 32;
+export const BALL_CLASS_ID = 0; // single-class trained model: the only class is "ball"
 const INPUT = 640;
 
 export interface Detection {
@@ -29,7 +29,7 @@ export interface Detection {
 
 let session: ort.InferenceSession | null = null;
 
-export async function loadYolo(modelUrl = "/models/yolov8n.onnx", wasmPath = "/ort/"): Promise<void> {
+export async function loadYolo(modelUrl = "/models/best.onnx", wasmPath = "/ort/"): Promise<void> {
   if (session) return;
   ort.env.wasm.wasmPaths = wasmPath;
   ort.env.wasm.numThreads = 1; // Pages has no cross-origin isolation for threads

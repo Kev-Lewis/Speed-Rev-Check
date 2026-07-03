@@ -17,7 +17,8 @@
  * `window.VideoDecoder` and fall back to the rVFC reader where it's missing.
  */
 
-import MP4Box, { type MP4File, type MP4Info, type MP4Sample, type MP4VideoTrack } from "mp4box";
+import * as MP4Box from "mp4box";
+import type { MP4File, MP4Info, MP4Sample, MP4VideoTrack } from "mp4box";
 import type { Frame, FrameTimingReport } from "./videoFrames";
 
 export interface WebCodecsExtractOptions {

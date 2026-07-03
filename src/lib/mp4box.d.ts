@@ -39,6 +39,4 @@ declare module "mp4box" {
     static BIG_ENDIAN: boolean;
     buffer: ArrayBuffer;
   }
-  const MP4Box: { createFile: typeof createFile; DataStream: typeof DataStream };
-  export default MP4Box;
 }

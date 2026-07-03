@@ -2,19 +2,25 @@
  * ballTracker.ts
  * ==================
  * Classical (no-ML) ball tracker using OpenCV.js background subtraction.
- * Feed it decoded frames in order; it returns the ball's per-frame position.
  *
  * Method: MOG2 background subtraction (static lane, moving ball) -> denoise ->
- * contours -> keep blobs that are the right size AND round enough -> pick the
- * one closest to the previous position (temporal continuity), or the largest
- * round blob when first acquiring the track.
+ * contours -> keep blobs that are the right size AND round enough AND INSIDE the
+ * lane region -> pick the one closest to the previous position (continuity), or
+ * the largest round blob when first acquiring the track.
  *
- * This is a first pass: it WILL need per-clip tuning and may occasionally lock
- * onto the bowler or pins. The live overlay is there so you can see that happen
- * and adjust the options below. Every Mat is released to avoid wasm memory leaks.
+ * The `roi` lane quad is the big discriminator: it excludes the bowler and his
+ * hand/arm (all on the approach, outside the lane) and means tracking only
+ * begins once the ball crosses the near edge (the foul line) into the lane.
+ *
+ * Every Mat is released to avoid wasm memory leaks.
  */
 
 type CV = any;
+
+export interface Point {
+  x: number;
+  y: number;
+}
 
 export interface BallDetection {
   index: number;
@@ -27,14 +33,29 @@ export interface BallDetection {
 }
 
 export interface BallTrackerOptions {
-  minArea?: number; // ignore blobs smaller than this (px^2)
-  maxArea?: number; // ignore blobs larger than this (excludes the bowler's body)
-  minCircularity?: number; // 1.0 = perfect circle; ball is usually > 0.55
-  maxJump?: number; // max px the ball may move between frames once tracked
-  maxMisses?: number; // consecutive misses before allowing re-acquisition
-  morphSize?: number; // denoise kernel size
+  roi?: Point[]; // lane quad (video coords). Detections outside are ignored. Empty = no gating.
+  minArea?: number;
+  maxArea?: number;
+  minCircularity?: number;
+  maxJump?: number;
+  maxMisses?: number;
+  morphSize?: number;
   mog2History?: number;
   mog2VarThreshold?: number;
+}
+
+/** Ray-casting point-in-polygon test. */
+function pointInPolygon(p: Point, poly: Point[]): boolean {
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x,
+      yi = poly[i].y,
+      xj = poly[j].x,
+      yj = poly[j].y;
+    const intersect = yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 export class BallTracker {
@@ -50,9 +71,10 @@ export class BallTracker {
   constructor(cv: CV, opts: BallTrackerOptions = {}) {
     this.cv = cv;
     this.opts = {
+      roi: [],
       minArea: 200,
       maxArea: 8000,
-      minCircularity: 0.55,
+      minCircularity: 0.6,
       maxJump: 250,
       maxMisses: 8,
       morphSize: 5,
@@ -62,7 +84,6 @@ export class BallTracker {
     };
     this.fgMask = new cv.Mat();
     this.kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(this.opts.morphSize, this.opts.morphSize));
-    // (history, varThreshold, detectShadows=false) -> clean binary mask
     this.mog2 = new cv.BackgroundSubtractorMOG2(this.opts.mog2History, this.opts.mog2VarThreshold, false);
   }
 
@@ -77,6 +98,7 @@ export class BallTracker {
     const hierarchy = new cv.Mat();
     cv.findContours(this.fgMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
+    const gateOn = this.opts.roi.length >= 3;
     let best: BallDetection | null = null;
     let bestScore = -Infinity;
 
@@ -92,13 +114,16 @@ export class BallTracker {
             const x = m.m10 / m.m00;
             const y = m.m01 / m.m00;
             let ok = true;
-            let score: number;
-            if (this.last) {
-              const d = Math.hypot(x - this.last.x, y - this.last.y);
-              if (d > this.opts.maxJump) ok = false;
-              score = -d; // prefer the blob nearest the last known position
-            } else {
-              score = area; // first acquisition: the biggest round blob
+            if (gateOn && !pointInPolygon({ x, y }, this.opts.roi)) ok = false; // lane gate
+            let score = 0;
+            if (ok) {
+              if (this.last) {
+                const d = Math.hypot(x - this.last.x, y - this.last.y);
+                if (d > this.opts.maxJump) ok = false;
+                score = -d; // prefer nearest to last known position
+              } else {
+                score = area; // first acquisition: biggest round blob in the lane
+              }
             }
             if (ok && score > bestScore) {
               bestScore = score;
@@ -120,7 +145,7 @@ export class BallTracker {
       this.path.push(best);
     } else {
       this.misses++;
-      if (this.misses >= this.opts.maxMisses) this.last = null; // allow re-acquisition
+      if (this.misses >= this.opts.maxMisses) this.last = null;
     }
     return best;
   }

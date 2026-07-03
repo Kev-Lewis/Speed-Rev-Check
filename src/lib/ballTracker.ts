@@ -3,20 +3,21 @@
  * ==================
  * Classical (no-ML) ball tracker using OpenCV.js background subtraction.
  *
- * Pipeline: MOG2 background subtraction -> denoise -> contours -> keep blobs that
- * pass size + roundness + lane-region + expected-size + direction gates -> among
- * survivors, prefer the one nearest the last position (or best size-match on first
- * acquisition).
+ * Pipeline: MOG2 background subtraction -> denoise -> contours -> gate blobs by
+ * size / roundness / lane-region / expected-size / direction -> pick nearest (or
+ * best size-match on first acquisition) -> CONFIRM before trusting.
  *
  * Gates:
- *  - roi (lane quad): excludes the bowler/hand and delays the track until the ball
- *    crosses the near edge (foul line).
- *  - expected size: the lane quad gives lane width at every depth; a ball is a fixed
- *    fraction of that, so we know how big the ball should look at each point. Blobs
- *    far off that size (merged reflection, hand, head) are rejected, and first
- *    acquisition prefers the best size-match rather than the biggest blob.
- *  - down-lane direction: once moving, candidates must have a forward component, so
- *    the track can't snap backward onto the hand.
+ *  - roi (lane quad): excludes bowler/hand; delays track until the ball crosses
+ *    the near edge (foul line).
+ *  - expected size (from lane-width perspective): rejects merged reflections,
+ *    hand, head; first acquisition prefers best size-match, not biggest blob.
+ *  - down-lane direction: no snapping backward onto the hand.
+ *  - COMMIT rule: a candidate track must make real down-lane PROGRESS over a few
+ *    frames before it's committed to the path. The hand hovers near the foul line
+ *    without progressing, so it never commits; the ball advances and commits fast.
+ *    This removes the jagged pre-release hand trail and yields a clean foul-line
+ *    crossing for the speed calc.
  *
  * Every Mat is released to avoid wasm memory leaks.
  */
@@ -47,9 +48,11 @@ export interface BallTrackerOptions {
   maxMisses?: number;
   directionGate?: boolean;
   backwardTolerance?: number;
-  ballRadiusRatio?: number; // ball radius as a fraction of local lane width (~0.1)
-  sizeGateLo?: number; // accept radius >= expected * sizeGateLo
-  sizeGateHi?: number; // accept radius <= expected * sizeGateHi
+  ballRadiusRatio?: number;
+  sizeGateLo?: number;
+  sizeGateHi?: number;
+  commitFrames?: number; // frames of a tentative track examined for progress
+  commitProgressRatio?: number; // required down-lane progress as a fraction of lane length
   morphSize?: number;
   mog2History?: number;
   mog2VarThreshold?: number;
@@ -80,12 +83,14 @@ export class BallTracker {
   private misses = 0;
   private opts: Required<BallTrackerOptions>;
 
-  // lane geometry (set when roi has 4 corners)
   private nearMid: Point | null = null;
-  private downlane: Point | null = null; // unit vector foul line -> pins
+  private downlane: Point | null = null;
   private laneLen = 1;
   private nearWidth = 0;
   private farWidth = 0;
+
+  private committed = false;
+  private tentative: BallDetection[] = [];
 
   readonly path: BallDetection[] = [];
 
@@ -103,6 +108,8 @@ export class BallTracker {
       ballRadiusRatio: 0.1,
       sizeGateLo: 0.35,
       sizeGateHi: 3.0,
+      commitFrames: 4,
+      commitProgressRatio: 0.05,
       morphSize: 5,
       mog2History: 120,
       mog2VarThreshold: 32,
@@ -126,7 +133,6 @@ export class BallTracker {
     this.mog2 = new cv.BackgroundSubtractorMOG2(this.opts.mog2History, this.opts.mog2VarThreshold, false);
   }
 
-  /** Expected ball radius (px) at a point, from lane-width perspective. 0 if no lane geometry. */
   private expectedRadius(p: Point): number {
     if (!this.nearMid || !this.downlane) return 0;
     const relX = p.x - this.nearMid.x;
@@ -167,9 +173,8 @@ export class BallTracker {
             const r = Math.sqrt(area / Math.PI);
             let ok = true;
 
-            if (gateOn && !pointInPolygon({ x, y }, this.opts.roi)) ok = false; // lane gate
+            if (gateOn && !pointInPolygon({ x, y }, this.opts.roi)) ok = false;
 
-            // expected-size gate: rejects merged reflection blobs, hand, head
             const expR = sizeOn ? this.expectedRadius({ x, y }) : 0;
             if (ok && sizeOn && expR > 0) {
               if (r < expR * this.opts.sizeGateLo || r > expR * this.opts.sizeGateHi) ok = false;
@@ -186,9 +191,8 @@ export class BallTracker {
                   const forward = stepX * this.downlane.x + stepY * this.downlane.y;
                   if (forward < -this.opts.backwardTolerance) ok = false;
                 }
-                score = -d; // prefer nearest to last position
+                score = -d;
               } else {
-                // first acquisition: prefer the best size-match (not the biggest blob)
                 score = expR > 0 ? -Math.abs(r - expR) : area;
               }
             }
@@ -207,15 +211,39 @@ export class BallTracker {
     hierarchy.delete();
     src.delete();
 
+    let output: BallDetection | null = null;
     if (best) {
       this.last = { x: best.x, y: best.y };
       this.misses = 0;
-      this.path.push(best);
+      if (!this.downlane || this.committed) {
+        this.path.push(best); // no lane geometry, or already trusted
+        output = best;
+      } else {
+        // build a tentative track and commit only once it has progressed down-lane
+        this.tentative.push(best);
+        if (this.tentative.length >= this.opts.commitFrames) {
+          const f = this.tentative[0];
+          const l = this.tentative[this.tentative.length - 1];
+          const progress = (l.x - f.x) * this.downlane.x + (l.y - f.y) * this.downlane.y;
+          if (progress >= this.opts.commitProgressRatio * this.laneLen) {
+            this.committed = true;
+            for (const d of this.tentative) this.path.push(d);
+            this.tentative = [];
+            output = best; // trusted from here on
+          } else {
+            this.tentative.shift(); // slide the window; a hovering hand never accrues progress
+          }
+        }
+      }
     } else {
       this.misses++;
-      if (this.misses >= this.opts.maxMisses) this.last = null;
+      if (this.misses >= this.opts.maxMisses) {
+        this.last = null;
+        this.committed = false;
+        this.tentative = [];
+      }
     }
-    return best;
+    return output; // null until the track is committed, so the hand never gets circled
   }
 
   dispose(): void {

@@ -11,25 +11,33 @@ export default function App() {
   const [busy, setBusy] = useState(false);
 
   async function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
+    const input = e.target;
+    const file = input.files?.[0];
+    console.log("[app] handleFile fired", file ? { name: file.name, type: file.type, size: file.size } : "no file");
     if (!file) return;
     setBusy(true);
     setSummary("");
 
-    setStatus("Loading OpenCV.js (~8 MB, first time only)…");
+    setStatus("Loading OpenCV.js (~9 MB, first time only)…");
+    console.log("[app] loading OpenCV…");
     let cv: any;
     try {
       cv = await loadOpenCV();
+      console.log("[app] OpenCV ready:", typeof cv, "Mat?", !!cv?.Mat);
     } catch (err) {
+      console.error("[app] OpenCV load failed:", err);
       setStatus(`OpenCV load failed: ${(err as Error).message}`);
       setBusy(false);
+      input.value = "";
       return;
     }
 
     const display = canvasRef.current!;
     const dctx = display.getContext("2d")!;
     const tracker = new BallTracker(cv);
-    const reader = isWebCodecsSupported() ? extractFramesWebCodecs : extractFrames;
+    const wc = isWebCodecsSupported();
+    const reader = wc ? extractFramesWebCodecs : extractFrames;
+    console.log("[app] starting tracker, reader =", wc ? "WebCodecs" : "rVFC");
 
     let found = 0;
     let total = 0;
@@ -47,7 +55,6 @@ export default function App() {
         }
         dctx.drawImage(frame.canvas, 0, 0);
 
-        // trajectory trail
         if (tracker.path.length > 1) {
           dctx.strokeStyle = "rgba(0,200,255,0.9)";
           dctx.lineWidth = 2;
@@ -55,7 +62,6 @@ export default function App() {
           tracker.path.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
           dctx.stroke();
         }
-        // current detection
         if (det) {
           dctx.strokeStyle = "red";
           dctx.lineWidth = 3;
@@ -64,23 +70,28 @@ export default function App() {
           dctx.stroke();
         }
 
-        if (total % 15 === 0) setStatus(`Tracking… ${total} frames, ball found in ${found}`);
-        // yield so the canvas paints and the overlay animates
+        if (total % 30 === 0) {
+          console.log(`[app] frame ${total}, ball found in ${found}`);
+          setStatus(`Tracking… ${total} frames, ball found in ${found}`);
+        }
         await new Promise((r) => requestAnimationFrame(() => r(null)));
       });
 
       tracker.dispose();
       const pct = total ? Math.round((100 * found) / total) : 0;
+      console.log(`[app] done. found ${found}/${total} (${pct}%)`, report);
       setStatus("");
       setSummary(
         `Done. Ball detected in ${found}/${total} frames (${pct}%). ` +
           `True ${report.estimatedFps.toFixed(0)} fps, ${report.frameCount} frames.`
       );
     } catch (err) {
+      console.error("[app] tracking error:", err);
       tracker.dispose();
       setStatus(`Error: ${(err as Error).message}`);
     } finally {
       setBusy(false);
+      input.value = ""; // allow re-selecting the same file
     }
   }
 
@@ -89,10 +100,10 @@ export default function App() {
       <h1>Speed-Rev-Check</h1>
       <p style={{ opacity: 0.7 }}>
         Ball tracker — watch it follow the ball. If it locks onto the bowler or pins, tune the options in{" "}
-        <code>ballTracker.ts</code> (minArea / maxArea / minCircularity).
+        <code>ballTracker.ts</code>. Progress shows below and in the console.
       </p>
       <input type="file" accept="video/*" onChange={handleFile} disabled={busy} />
-      {status && <p>{status}</p>}
+      <p style={{ minHeight: "1.2em" }}>{status || (busy ? "Working…" : "")}</p>
       {summary && <p>{summary}</p>}
       <canvas ref={canvasRef} style={{ width: "100%", maxWidth: 480, border: "1px solid #333", borderRadius: 6 }} />
     </main>

@@ -23,7 +23,7 @@ declare global {
 let loadingPromise: Promise<any> | null = null;
 
 export function loadOpenCV(
-  src = "https://docs.opencv.org/4.x/opencv.js",
+  src = "/opencv.js", // self-hosted in /public — no third-party CDN for an extension to block
   timeoutMs = 60000
 ): Promise<any> {
   if (typeof window !== "undefined" && window.cv && window.cv.Mat) return Promise.resolve(window.cv);

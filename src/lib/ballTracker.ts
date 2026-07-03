@@ -3,14 +3,19 @@
  * ==================
  * Classical (no-ML) ball tracker using OpenCV.js background subtraction.
  *
- * Method: MOG2 background subtraction (static lane, moving ball) -> denoise ->
- * contours -> keep blobs that are the right size AND round enough AND INSIDE the
- * lane region -> pick the one closest to the previous position (continuity), or
- * the largest round blob when first acquiring the track.
+ * Pipeline: MOG2 background subtraction (static lane, moving ball) -> denoise ->
+ * contours -> keep blobs that pass size + roundness + lane-region gates -> among
+ * survivors, prefer the one nearest the last position AND moving down-lane.
  *
- * The `roi` lane quad is the big discriminator: it excludes the bowler and his
- * hand/arm (all on the approach, outside the lane) and means tracking only
- * begins once the ball crosses the near edge (the foul line) into the lane.
+ * Two gates do the heavy lifting:
+ *  - roi (lane quad): excludes the bowler/hand (on the approach) and delays the
+ *    track until the ball crosses the near edge (the foul line).
+ *  - down-lane direction: once the ball is moving, candidates must have a forward
+ *    (toward-pins) component, so the track can't snap backward onto the hand.
+ *
+ * Defaults are tuned loose enough to hold a fast, motion-blurred ball right after
+ * release (blur lowers roundness and inflates area), which is where a strict
+ * tracker loses it.
  *
  * Every Mat is released to avoid wasm memory leaks.
  */
@@ -33,18 +38,19 @@ export interface BallDetection {
 }
 
 export interface BallTrackerOptions {
-  roi?: Point[]; // lane quad (video coords). Detections outside are ignored. Empty = no gating.
+  roi?: Point[]; // lane quad (video coords), order: foulL, foulR, pinR, pinL. Empty = no gating.
   minArea?: number;
   maxArea?: number;
   minCircularity?: number;
-  maxJump?: number;
+  maxJump?: number; // max px between frames once tracked (raised for fast release)
   maxMisses?: number;
+  directionGate?: boolean; // require forward (down-lane) motion once tracked
+  backwardTolerance?: number; // px of backward slack allowed before rejecting
   morphSize?: number;
   mog2History?: number;
   mog2VarThreshold?: number;
 }
 
-/** Ray-casting point-in-polygon test. */
 function pointInPolygon(p: Point, poly: Point[]): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -66,22 +72,36 @@ export class BallTracker {
   private last: { x: number; y: number } | null = null;
   private misses = 0;
   private opts: Required<BallTrackerOptions>;
+  private downlane: Point | null = null; // unit vector from foul line toward pins
   readonly path: BallDetection[] = [];
 
   constructor(cv: CV, opts: BallTrackerOptions = {}) {
     this.cv = cv;
     this.opts = {
       roi: [],
-      minArea: 200,
-      maxArea: 8000,
-      minCircularity: 0.6,
-      maxJump: 250,
+      minArea: 150,
+      maxArea: 20000, // raised: a blurred near-release ball is large
+      minCircularity: 0.45, // lowered: motion blur elongates the ball
+      maxJump: 400, // raised: fast ball jumps far between frames
       maxMisses: 8,
+      directionGate: true,
+      backwardTolerance: 15,
       morphSize: 5,
       mog2History: 120,
       mog2VarThreshold: 32,
       ...opts,
     };
+
+    if (this.opts.roi.length === 4) {
+      const r = this.opts.roi;
+      const nearMid = { x: (r[0].x + r[1].x) / 2, y: (r[0].y + r[1].y) / 2 };
+      const farMid = { x: (r[2].x + r[3].x) / 2, y: (r[2].y + r[3].y) / 2 };
+      const dx = farMid.x - nearMid.x;
+      const dy = farMid.y - nearMid.y;
+      const len = Math.hypot(dx, dy) || 1;
+      this.downlane = { x: dx / len, y: dy / len };
+    }
+
     this.fgMask = new cv.Mat();
     this.kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(this.opts.morphSize, this.opts.morphSize));
     this.mog2 = new cv.BackgroundSubtractorMOG2(this.opts.mog2History, this.opts.mog2VarThreshold, false);
@@ -115,16 +135,24 @@ export class BallTracker {
             const y = m.m01 / m.m00;
             let ok = true;
             if (gateOn && !pointInPolygon({ x, y }, this.opts.roi)) ok = false; // lane gate
+
             let score = 0;
             if (ok) {
               if (this.last) {
-                const d = Math.hypot(x - this.last.x, y - this.last.y);
+                const stepX = x - this.last.x;
+                const stepY = y - this.last.y;
+                const d = Math.hypot(stepX, stepY);
                 if (d > this.opts.maxJump) ok = false;
-                score = -d; // prefer nearest to last known position
+                if (ok && this.opts.directionGate && this.downlane) {
+                  const forward = stepX * this.downlane.x + stepY * this.downlane.y;
+                  if (forward < -this.opts.backwardTolerance) ok = false; // no snapping backward
+                }
+                score = -d; // prefer nearest to last position
               } else {
                 score = area; // first acquisition: biggest round blob in the lane
               }
             }
+
             if (ok && score > bestScore) {
               bestScore = score;
               best = { index, mediaTime, x, y, r: Math.sqrt(area / Math.PI), area, circularity };

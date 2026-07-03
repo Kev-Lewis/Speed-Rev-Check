@@ -22,7 +22,8 @@ export default function App() {
     console.log("[app] loading OpenCV…");
     let cv: any;
     try {
-      cv = await loadOpenCV();
+      const res = await loadOpenCV();
+      cv = res.cv;
       console.log("[app] OpenCV ready:", typeof cv, "Mat?", !!cv?.Mat);
     } catch (err) {
       console.error("[app] OpenCV load failed:", err);

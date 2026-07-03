@@ -1,59 +1,70 @@
 /*
  * opencvLoader.ts
  * ==================
- * Loads OpenCV.js via the @techstark/opencv-js npm package (the docs single-file
- * build with the wasm EMBEDDED). No <script> tag, no self-hosted /opencv.js, no
- * CDN — so nothing for a browser extension to block and no wasm path issues.
+ * Loads OpenCV.js via @techstark/opencv-js (docs single-file build, wasm embedded).
+ * Dynamically imported so its ~11 MB lands in a lazy chunk fetched on first use.
  *
  *   npm install @techstark/opencv-js
  *
- * The package is dynamically imported so its ~11 MB lands in its own lazy chunk,
- * fetched only when tracking starts, keeping the initial page load fast.
+ * CAREFUL: the OpenCV module is "thenable" (Emscripten adds a `.then` that is NOT
+ * a real Promise). If you `await` it, `resolve(cv)` with it, or `return cv` from an
+ * async fn, JS tries to adopt it as a promise and throws
+ * "Promise.prototype.then called on incompatible receiver". So we:
+ *   - detect readiness with `instanceof Promise` (real) + `.Mat` + onRuntimeInitialized,
+ *   - resolve the wait-promise with nothing (void),
+ *   - return the module wrapped as { cv } so it never passes through promise adoption.
  *
- * Resolution handles all three shapes the package can present: a Promise, an
- * already-initialized module, or one that fires onRuntimeInitialized later.
- * A poll + hard timeout guarantee it can never hang silently.
+ * Call site:  const { cv } = await loadOpenCV();
  */
 
-let readyPromise: Promise<any> | null = null;
+let cvReady: any = null;
+let pending: Promise<void> | null = null;
 
-export function loadOpenCV(timeoutMs = 60000): Promise<any> {
-  if (readyPromise) return readyPromise;
+export function loadOpenCV(timeoutMs = 60000): Promise<{ cv: any }> {
+  if (cvReady) return Promise.resolve({ cv: cvReady });
 
-  readyPromise = (async () => {
-    const mod: any = await import("@techstark/opencv-js");
-    const cv: any = mod.default ?? mod;
+  if (!pending) {
+    pending = (async () => {
+      const mod: any = await import("@techstark/opencv-js");
+      const cvModule: any = mod.default ?? mod;
 
-    // Case 1: package exports a Promise for the ready module
-    if (cv && typeof cv.then === "function") return await cv;
-    // Case 2: already initialized
-    if (cv && cv.Mat) return cv;
+      if (cvModule instanceof Promise) {
+        cvReady = await cvModule; // this branch is a genuine Promise, safe to await
+        return;
+      }
+      if (cvModule.Mat) {
+        cvReady = cvModule; // already initialized
+        return;
+      }
 
-    // Case 3: wait for the wasm runtime — poll + callback + timeout
-    return await new Promise<any>((resolve, reject) => {
-      let settled = false;
-      const finish = () => {
-        if (!settled && cv && cv.Mat) {
-          settled = true;
-          clearInterval(poll);
-          clearTimeout(timer);
-          resolve(cv);
-        }
-      };
-      const poll = setInterval(finish, 50);
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          clearInterval(poll);
-          reject(new Error(`OpenCV did not initialize within ${timeoutMs / 1000}s.`));
-        }
-      }, timeoutMs);
-      cv.onRuntimeInitialized = finish;
+      // Wait for the wasm runtime. Resolve with VOID (never with the thenable module).
+      await new Promise<void>((resolve, reject) => {
+        let done = false;
+        const check = () => {
+          if (!done && cvModule.Mat) {
+            done = true;
+            clearInterval(poll);
+            clearTimeout(timer);
+            resolve();
+          }
+        };
+        const poll = setInterval(check, 50);
+        const timer = setTimeout(() => {
+          if (!done) {
+            done = true;
+            clearInterval(poll);
+            reject(new Error(`OpenCV did not initialize within ${timeoutMs / 1000}s.`));
+          }
+        }, timeoutMs);
+        cvModule.onRuntimeInitialized = check;
+      });
+      cvReady = cvModule;
+    })().catch((e) => {
+      pending = null; // allow retry
+      throw e;
     });
-  })().catch((e) => {
-    readyPromise = null; // allow a later retry
-    throw e;
-  });
+  }
 
-  return readyPromise;
+  // Wrap in a plain object so the thenable module never triggers promise adoption.
+  return pending.then(() => ({ cv: cvReady }));
 }

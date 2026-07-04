@@ -11,8 +11,8 @@ const FOUL_TO_ARROWS_FT = 15;
 const CORNER_LABELS = ["foul line — LEFT", "foul line — RIGHT", "arrows — RIGHT", "arrows — LEFT"];
 
 // --- Tunables (calibrate against your hand-measured throw) ---
-const LOFT_SKIP = 6; // initial committed frames to drop (the airborne launch). Raise if you loft more.
-const SPEED_CALIBRATION = 1.0; // multiply speed to match ground truth; e.g. set 16.3/your_reading.
+const LOFT_SKIP = 0; // fit the full 15 ft window (matches foul→arrows averaging; release is the fast part)
+const SPEED_CALIBRATION = 1.08; // corrects far-edge/arrows placement scale to hand-measured truth
 
 function smooth(pts: Point[], w = 3): Point[] {
   if (pts.length <= 2) return pts;
@@ -225,13 +225,13 @@ export default function App() {
       const seconds = lane.laneLen / slopeFit.slopePxPerSec / SPEED_CALIBRATION;
       const speed = releaseSpeedFromSeconds(seconds);
 
-      // clean fitted trajectory, extrapolated to the foul line (loft removed, perfectly smooth)
+      // clean fitted trajectory in LANE coordinates, so depth=0 lands exactly on the foul line
       const depths = rolling.map((s) => s.depthPx);
-      const fx = linreg(depths, rolling.map((s) => s.x));
-      const fy = linreg(depths, rolling.map((s) => s.y));
-      if (fx && fy) {
-        const foulPt = { x: fx.b, y: fy.b }; // depth 0
-        const arrowPt = { x: fx.m * lane.laneLen + fx.b, y: fy.m * lane.laneLen + fy.b };
+      const laterals = rolling.map((s) => lane.signedLateral({ x: s.x, y: s.y }));
+      const latFit = linreg(depths, laterals);
+      if (latFit) {
+        const foulPt = lane.toImage(0, latFit.b); // on the foul line
+        const arrowPt = lane.toImage(lane.laneLen, latFit.m * lane.laneLen + latFit.b);
         dctx.strokeStyle = "rgba(0,225,255,1)";
         dctx.lineWidth = 4;
         dctx.beginPath();
@@ -240,7 +240,7 @@ export default function App() {
         dctx.stroke();
         dctx.fillStyle = "red";
         dctx.beginPath();
-        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // marks the foul-line connection
+        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // sits on the foul line
         dctx.fill();
       }
 

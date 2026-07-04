@@ -54,6 +54,19 @@ export class LaneModel {
     return Math.abs(dot(sub(p, this.nearMid), this.normal));
   }
 
+  /** Signed offset from the center line (sign = which side). */
+  signedLateral(p: Point): number {
+    return dot(sub(p, this.nearMid), this.normal);
+  }
+
+  /** Convert lane coordinates (depth along lane, lateral offset) back to an image point. */
+  toImage(depthPx: number, lateralPx: number): Point {
+    return {
+      x: this.nearMid.x + depthPx * this.downlane.x + lateralPx * this.normal.x,
+      y: this.nearMid.y + depthPx * this.downlane.y + lateralPx * this.normal.y,
+    };
+  }
+
   /** Lane width in px at the given point's depth (perspective interpolation). */
   localWidth(p: Point): number {
     let t = this.depthPx(p) / this.laneLen;

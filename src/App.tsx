@@ -10,8 +10,11 @@ type Phase = "idle" | "calibrating" | "ready" | "tracking" | "done";
 const FOUL_TO_ARROWS_FT = 15;
 const CORNER_LABELS = ["foul line — LEFT", "foul line — RIGHT", "arrows — RIGHT", "arrows — LEFT"];
 
-/** Moving-average smoothing of a polyline for display. */
-function smooth(pts: Point[], w = 2): Point[] {
+// --- Tunables (calibrate against your hand-measured throw) ---
+const LOFT_SKIP = 6; // initial committed frames to drop (the airborne launch). Raise if you loft more.
+const SPEED_CALIBRATION = 1.0; // multiply speed to match ground truth; e.g. set 16.3/your_reading.
+
+function smooth(pts: Point[], w = 3): Point[] {
   if (pts.length <= 2) return pts;
   return pts.map((_, i) => {
     let sx = 0,
@@ -24,6 +27,26 @@ function smooth(pts: Point[], w = 2): Point[] {
     }
     return { x: sx / c, y: sy / c };
   });
+}
+
+/** Least-squares line y = m*x + b. */
+function linreg(xs: number[], ys: number[]): { m: number; b: number } | null {
+  const n = xs.length;
+  if (n < 2) return null;
+  let sx = 0,
+    sy = 0,
+    sxx = 0,
+    sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sx += xs[i];
+    sy += ys[i];
+    sxx += xs[i] * xs[i];
+    sxy += xs[i] * ys[i];
+  }
+  const d = n * sxx - sx * sx;
+  if (Math.abs(d) < 1e-9) return null;
+  const m = (n * sxy - sx * sy) / d;
+  return { m, b: (sy - m * sx) / n };
 }
 
 export default function App() {
@@ -136,14 +159,22 @@ export default function App() {
     let hits = 0;
     setStatus("Detecting + tracking… (wasm inference is slow)");
 
+    const drawLane = () => {
+      dctx.strokeStyle = "rgba(255,255,0,0.7)";
+      dctx.lineWidth = 2;
+      dctx.beginPath();
+      points.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
+      dctx.closePath();
+      dctx.stroke();
+    };
+
     try {
       await reader(file, async (frame) => {
         total++;
         const dets = await detect(frame.canvas, 0.3);
-        // track the CONTACT point (bottom-center of the box) — it sits on the lane plane
         const candidates: Candidate[] = dets.map((d) => ({
           x: d.x + d.w / 2,
-          y: d.y + d.h, // bottom of the ball
+          y: d.y + d.h, // contact point (bottom of ball, on the lane plane)
           r: (d.w + d.h) / 4,
           score: d.score,
         }));
@@ -155,23 +186,16 @@ export default function App() {
           display.height = frame.height;
         }
         dctx.drawImage(frame.canvas, 0, 0);
-        // lane
-        dctx.strokeStyle = "rgba(255,255,0,0.7)";
-        dctx.lineWidth = 2;
-        dctx.beginPath();
-        points.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
-        dctx.closePath();
-        dctx.stroke();
-        // smoothed contact-point trail (the real ball path on the lane)
+        drawLane();
+        // faint live trail for feedback
         if (track.path.length > 1) {
           const sm = smooth(track.path.map((s) => ({ x: s.x, y: s.y })));
-          dctx.strokeStyle = "rgba(0,200,255,0.95)";
-          dctx.lineWidth = 3;
+          dctx.strokeStyle = "rgba(0,200,255,0.45)";
+          dctx.lineWidth = 2;
           dctx.beginPath();
           sm.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
           dctx.stroke();
         }
-        // current ball (circle drawn at the CENTER, i.e. contact point lifted by r)
         if (chosen) {
           dctx.strokeStyle = "lime";
           dctx.lineWidth = 3;
@@ -183,28 +207,43 @@ export default function App() {
         await new Promise((r) => requestAnimationFrame(() => r(null)));
       });
 
-      // --- speed from a line fit over the ROLLING part of the 15 ft window ---
-      // Skip the first stretch: right after release the ball is lofted above the lane,
-      // which biases its projected depth. Fit the settled roll and extrapolate to the foul line.
-      const FIT_START_FRAC = 0.2; // raise if you loft more (speed reads low); lower if it reads high
-      const windowSamples = track.path.filter(
-        (s) => s.depthPx >= FIT_START_FRAC * lane.laneLen && s.depthPx <= lane.laneLen
-      );
-      const fit = fitDepthSlope(windowSamples);
-      console.log("[app] path", track.path.length, "windowN", windowSamples.length, "fit", fit);
+      // --- fit the ROLLING segment (skip the airborne loft by TIME, not depth) ---
+      const rolling = track.path.slice(LOFT_SKIP).filter((s) => s.depthPx >= 0 && s.depthPx <= lane.laneLen);
+      const slopeFit = fitDepthSlope(rolling.map((s) => ({ mediaTime: s.mediaTime, depthPx: s.depthPx })));
+      console.log("[app] committed", track.path.length, "rolling", rolling.length, "slope", slopeFit);
 
-      if (!fit || fit.slopePxPerSec <= 0) {
+      if (!slopeFit || slopeFit.slopePxPerSec <= 0 || rolling.length < 4) {
         setPhase("done");
         setStatus("");
         setSummary(
-          `Not enough in-lane track to fit a speed (${windowSamples.length} points in the 15 ft window). ` +
-            `Ball tracked in ${hits}/${total} frames. Make sure the far edge sits at the arrows so the ball travels the full box.`
+          `Not enough clean rolling track to fit (${rolling.length} points). ` +
+            `Ball tracked in ${hits}/${total} frames. Try lowering LOFT_SKIP or re-clicking the far edge at the arrows.`
         );
         return;
       }
 
-      const seconds = lane.laneLen / fit.slopePxPerSec; // time to cross the 15 ft window
+      const seconds = lane.laneLen / slopeFit.slopePxPerSec / SPEED_CALIBRATION;
       const speed = releaseSpeedFromSeconds(seconds);
+
+      // clean fitted trajectory, extrapolated to the foul line (loft removed, perfectly smooth)
+      const depths = rolling.map((s) => s.depthPx);
+      const fx = linreg(depths, rolling.map((s) => s.x));
+      const fy = linreg(depths, rolling.map((s) => s.y));
+      if (fx && fy) {
+        const foulPt = { x: fx.b, y: fy.b }; // depth 0
+        const arrowPt = { x: fx.m * lane.laneLen + fx.b, y: fy.m * lane.laneLen + fy.b };
+        dctx.strokeStyle = "rgba(0,225,255,1)";
+        dctx.lineWidth = 4;
+        dctx.beginPath();
+        dctx.moveTo(foulPt.x, foulPt.y);
+        dctx.lineTo(arrowPt.x, arrowPt.y);
+        dctx.stroke();
+        dctx.fillStyle = "red";
+        dctx.beginPath();
+        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // marks the foul-line connection
+        dctx.fill();
+      }
+
       dctx.fillStyle = "red";
       dctx.font = "22px monospace";
       dctx.fillText(`${speed.mph.toFixed(1)} mph`, 12, 30);
@@ -212,8 +251,7 @@ export default function App() {
       setStatus("");
       setSummary(
         `Release speed: ${speed.mph.toFixed(1)} mph (${speed.kph.toFixed(1)} kph). ` +
-          `15 ft in ${seconds.toFixed(3)} s, fit over ${fit.n} points. Ball tracked in ${hits}/${total} frames.` +
-          (speed.warnings.length ? ` ⚠ ${speed.warnings.join(" ")}` : "")
+          `15 ft in ${seconds.toFixed(3)} s, fit over ${slopeFit.n} rolling points. Ball tracked in ${hits}/${total} frames.`
       );
     } catch (err) {
       setStatus(`Error: ${(err as Error).message}`);

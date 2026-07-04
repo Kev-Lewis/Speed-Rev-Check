@@ -83,3 +83,28 @@ export function crossingTime(
   }
   return null;
 }
+
+/**
+ * Least-squares slope of depth(px) vs time(s) — i.e. the ball's speed in px/s along
+ * the lane. Robust to where detection starts/stops and to per-frame jitter, and it
+ * extrapolates the constant-speed motion back through the foul line automatically.
+ */
+export function fitDepthSlope(
+  samples: Array<{ mediaTime: number; depthPx: number }>
+): { slopePxPerSec: number; n: number } | null {
+  const n = samples.length;
+  if (n < 2) return null;
+  let st = 0,
+    sd = 0,
+    stt = 0,
+    std = 0;
+  for (const s of samples) {
+    st += s.mediaTime;
+    sd += s.depthPx;
+    stt += s.mediaTime * s.mediaTime;
+    std += s.mediaTime * s.depthPx;
+  }
+  const denom = n * stt - st * st;
+  if (Math.abs(denom) < 1e-9) return null;
+  return { slopePxPerSec: (n * std - st * sd) / denom, n };
+}

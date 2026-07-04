@@ -2,13 +2,29 @@ import { useRef, useState } from "react";
 import { extractFramesWebCodecs, isWebCodecsSupported } from "./lib/videoFramesWebCodecs";
 import { extractFrames } from "./lib/videoFrames";
 import { loadYolo, detect } from "./lib/yoloDetector";
-import { LaneModel, crossingTime, type Point } from "./lib/laneModel";
+import { LaneModel, fitDepthSlope, type Point } from "./lib/laneModel";
 import { BallTrack, type Candidate } from "./lib/ballTrack";
 import { releaseSpeedFromSeconds } from "./lib/speedRevs";
 
 type Phase = "idle" | "calibrating" | "ready" | "tracking" | "done";
 const FOUL_TO_ARROWS_FT = 15;
 const CORNER_LABELS = ["foul line — LEFT", "foul line — RIGHT", "arrows — RIGHT", "arrows — LEFT"];
+
+/** Moving-average smoothing of a polyline for display. */
+function smooth(pts: Point[], w = 2): Point[] {
+  if (pts.length <= 2) return pts;
+  return pts.map((_, i) => {
+    let sx = 0,
+      sy = 0,
+      c = 0;
+    for (let j = Math.max(0, i - w); j <= Math.min(pts.length - 1, i + w); j++) {
+      sx += pts[j].x;
+      sy += pts[j].y;
+      c++;
+    }
+    return { x: sx / c, y: sy / c };
+  });
+}
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -124,9 +140,10 @@ export default function App() {
       await reader(file, async (frame) => {
         total++;
         const dets = await detect(frame.canvas, 0.3);
+        // track the CONTACT point (bottom-center of the box) — it sits on the lane plane
         const candidates: Candidate[] = dets.map((d) => ({
           x: d.x + d.w / 2,
-          y: d.y + d.h / 2,
+          y: d.y + d.h, // bottom of the ball
           r: (d.w + d.h) / 4,
           score: d.score,
         }));
@@ -145,52 +162,52 @@ export default function App() {
         points.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
         dctx.closePath();
         dctx.stroke();
-        // trajectory
+        // smoothed contact-point trail (the real ball path on the lane)
         if (track.path.length > 1) {
-          dctx.strokeStyle = "rgba(0,200,255,0.9)";
-          dctx.lineWidth = 2;
+          const sm = smooth(track.path.map((s) => ({ x: s.x, y: s.y })));
+          dctx.strokeStyle = "rgba(0,200,255,0.95)";
+          dctx.lineWidth = 3;
           dctx.beginPath();
-          track.path.forEach((s, i) => (i ? dctx.lineTo(s.x, s.y) : dctx.moveTo(s.x, s.y)));
+          sm.forEach((p, i) => (i ? dctx.lineTo(p.x, p.y) : dctx.moveTo(p.x, p.y)));
           dctx.stroke();
         }
-        // current ball
+        // current ball (circle drawn at the CENTER, i.e. contact point lifted by r)
         if (chosen) {
           dctx.strokeStyle = "lime";
           dctx.lineWidth = 3;
           dctx.beginPath();
-          dctx.arc(chosen.x, chosen.y, chosen.r, 0, 2 * Math.PI);
+          dctx.arc(chosen.x, chosen.y - chosen.r, chosen.r, 0, 2 * Math.PI);
           dctx.stroke();
         }
         if (total % 20 === 0) setStatus(`Tracking… ${total} frames, ball in ${hits}`);
         await new Promise((r) => requestAnimationFrame(() => r(null)));
       });
 
-      // --- crossings + speed ---
-      const t0 = crossingTime(track.path, 0); // foul line
-      const t1 = crossingTime(track.path, lane.laneLen); // arrows
-      console.log("[app] path", track.path.length, "t0", t0, "t1", t1);
+      // --- speed from a line fit over the 15 ft window (robust; extrapolates to the foul line) ---
+      const windowSamples = track.path.filter((s) => s.depthPx >= 0 && s.depthPx <= lane.laneLen);
+      const fit = fitDepthSlope(windowSamples);
+      console.log("[app] path", track.path.length, "windowN", windowSamples.length, "fit", fit);
 
-      if (t0 == null || t1 == null) {
+      if (!fit || fit.slopePxPerSec <= 0) {
         setPhase("done");
         setStatus("");
         setSummary(
-          `Couldn't get a clean crossing (${t0 == null ? "foul line" : "arrows"} not crossed by the track). ` +
-            `Ball tracked in ${hits}/${total} frames. Try re-clicking the corners so the near edge is right at the foul line and the far edge at the arrows.`
+          `Not enough in-lane track to fit a speed (${windowSamples.length} points in the 15 ft window). ` +
+            `Ball tracked in ${hits}/${total} frames. Make sure the far edge sits at the arrows so the ball travels the full box.`
         );
         return;
       }
 
-      const seconds = t1 - t0;
+      const seconds = lane.laneLen / fit.slopePxPerSec; // time to cross the 15 ft window
       const speed = releaseSpeedFromSeconds(seconds);
-      // mark crossings
       dctx.fillStyle = "red";
-      dctx.font = "20px monospace";
-      dctx.fillText(`${speed.mph.toFixed(1)} mph`, 12, 28);
+      dctx.font = "22px monospace";
+      dctx.fillText(`${speed.mph.toFixed(1)} mph`, 12, 30);
       setPhase("done");
       setStatus("");
       setSummary(
         `Release speed: ${speed.mph.toFixed(1)} mph (${speed.kph.toFixed(1)} kph). ` +
-          `15 ft in ${seconds.toFixed(3)} s. Ball tracked in ${hits}/${total} frames.` +
+          `15 ft in ${seconds.toFixed(3)} s, fit over ${fit.n} points. Ball tracked in ${hits}/${total} frames.` +
           (speed.warnings.length ? ` ⚠ ${speed.warnings.join(" ")}` : "")
       );
     } catch (err) {

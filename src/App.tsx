@@ -5,7 +5,7 @@ import { loadYolo, detect } from "./lib/yoloDetector";
 import { LaneModel, fitDepthSlope, type Point } from "./lib/laneModel";
 import { BallTrack, type Candidate } from "./lib/ballTrack";
 import { releaseSpeedFromSeconds, revsFromRotationsOverSeconds } from "./lib/speedRevs";
-import { detectTapeAngle, computeRevWindow, type RevSample } from "./lib/tapeTracker";
+import { MarkTracker } from "./lib/tapeTracker";
 
 type Phase = "idle" | "calibrating" | "ready" | "tracking" | "done";
 const FOUL_TO_ARROWS_FT = 15;
@@ -14,7 +14,7 @@ const CORNER_LABELS = ["foul line — LEFT", "foul line — RIGHT", "arrows — 
 // --- Tunables (calibrate against your hand-measured throw) ---
 const LOFT_SKIP = 0; // fit the full 15 ft window (matches foul→arrows averaging; release is the fast part)
 const SPEED_CALIBRATION = 1.08; // corrects far-edge/arrows placement scale to hand-measured truth
-const REV_WINDOW_FRAMES = 20; // early frames (near release) used for rev rate; lane friction changes it later
+const REV_WINDOW_FRAMES = 40; // max frames of the early mark run used for rev rate
 
 function smooth(pts: Point[], w = 3): Point[] {
   if (pts.length <= 2) return pts;
@@ -169,7 +169,7 @@ export default function App() {
     const reader = isWebCodecsSupported() ? extractFramesWebCodecs : extractFrames;
     let total = 0;
     let hits = 0;
-    const revSamples: RevSample[] = [];
+    const markTracker = new MarkTracker();
     setStatus("Detecting + tracking… (wasm inference is slow)");
 
     const drawLane = () => {
@@ -219,19 +219,18 @@ export default function App() {
           dctx.arc(bcx, bcy, br, 0, 2 * Math.PI);
           dctx.stroke();
 
-          // white tape -> angle around ball center (rev tracking)
-          const tape = detectTapeAngle(frame.canvas, bcx, bcy, br);
-          if (tape) {
-            revSamples.push({ mediaTime: frame.mediaTime, angle: tape.angle });
+          // yellow logo -> mark tracking (rev rate), with continuity
+          const mark = markTracker.process(frame.canvas, bcx, bcy, br, frame.mediaTime);
+          if (mark) {
             dctx.strokeStyle = "magenta";
             dctx.lineWidth = 2;
             dctx.beginPath();
             dctx.moveTo(bcx, bcy);
-            dctx.lineTo(tape.tx, tape.ty);
+            dctx.lineTo(mark.x, mark.y);
             dctx.stroke();
             dctx.fillStyle = "magenta";
             dctx.beginPath();
-            dctx.arc(tape.tx, tape.ty, 4, 0, 2 * Math.PI);
+            dctx.arc(mark.x, mark.y, 4, 0, 2 * Math.PI);
             dctx.fill();
           }
         }
@@ -291,9 +290,9 @@ export default function App() {
       dctx.font = "22px monospace";
       dctx.fillText(`${speed.mph.toFixed(1)} mph`, 12, 30);
 
-      // --- rev rate from the early tape sweep (release rev rate) ---
-      const revWin = computeRevWindow(revSamples, REV_WINDOW_FRAMES);
-      console.log("[app] tape frames", revSamples.length, "revWin", revWin);
+      // --- rev rate from the earliest solid mark run (release rev rate) ---
+      const revWin = markTracker.bestWindow(5, REV_WINDOW_FRAMES);
+      console.log("[app] revWin", revWin);
       let revText: string;
       if (revWin) {
         const rev = revsFromRotationsOverSeconds(revWin.rotations, revWin.seconds);
@@ -302,7 +301,7 @@ export default function App() {
         )} s over ${revWin.n} frames).`;
         dctx.fillText(`${Math.round(rev.rpm)} rpm`, 12, 58);
       } else {
-        revText = ` Rev rate: no clean tape sweep (${revSamples.length} tape frames) — try a slow-mo clip or check the tape threshold.`;
+        revText = ` Rev rate: no clean mark run — the yellow logo wasn't held long enough. Try a slow-mo clip, or tune hue/sat in tapeTracker.ts.`;
       }
 
       setPhase("done");

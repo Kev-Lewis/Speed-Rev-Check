@@ -235,17 +235,24 @@ export default function App() {
       const seconds = lane.laneLen / slopeFit.slopePxPerSec / SPEED_CALIBRATION;
       const speed = releaseSpeedFromSeconds(seconds);
 
-      // clean fitted trajectory as an image-space line, clipped to the clicked foul + arrows edges
+      // clean fitted trajectory clipped to foul + arrows; foul end anchored to real data
       const depths = rolling.map((s) => s.depthPx);
       const laterals = rolling.map((s) => lane.signedLateral({ x: s.x, y: s.y }));
       const latFit = linreg(depths, laterals);
       if (latFit) {
-        // P(depth) = O + depth*D  (affine in depth, so a straight image line)
+        // arrows end: from the fitted line (well-supported by data up there)
         const O = { x: lane.nearMid.x + latFit.b * lane.normal.x, y: lane.nearMid.y + latFit.b * lane.normal.y };
         const D = { x: lane.downlane.x + latFit.m * lane.normal.x, y: lane.downlane.y + latFit.m * lane.normal.y };
-        const foulPt = lineIntersect(O, D, points[0], points[1]) ?? lane.toImage(0, latFit.b);
         const arrowPt =
           lineIntersect(O, D, points[2], points[3]) ?? lane.toImage(lane.laneLen, latFit.m * lane.laneLen + latFit.b);
+
+        // foul end: extend from the EARLIEST real points (local direction), not a long extrapolation
+        const head = rolling.slice(0, Math.min(8, rolling.length));
+        const a = head[0];
+        const b = head[head.length - 1];
+        const dir = { x: a.x - b.x, y: a.y - b.y }; // pointing back toward the foul line
+        const foulPt = lineIntersect({ x: a.x, y: a.y }, dir, points[0], points[1]) ?? { x: a.x, y: a.y };
+
         dctx.strokeStyle = "rgba(0,225,255,1)";
         dctx.lineWidth = 4;
         dctx.beginPath();
@@ -254,7 +261,7 @@ export default function App() {
         dctx.stroke();
         dctx.fillStyle = "red";
         dctx.beginPath();
-        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // on the clicked foul line
+        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI);
         dctx.fill();
       }
 

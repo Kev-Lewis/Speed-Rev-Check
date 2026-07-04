@@ -49,6 +49,16 @@ function linreg(xs: number[], ys: number[]): { m: number; b: number } | null {
   return { m, b: (sy - m * sx) / n };
 }
 
+/** Intersection of the infinite line O + t*D with the line through A,B. */
+function lineIntersect(O: Point, D: Point, A: Point, B: Point): Point | null {
+  const ex = B.x - A.x;
+  const ey = B.y - A.y;
+  const det = -D.x * ey + ex * D.y;
+  if (Math.abs(det) < 1e-9) return null;
+  const t = (-(A.x - O.x) * ey + ex * (A.y - O.y)) / det;
+  return { x: O.x + t * D.x, y: O.y + t * D.y };
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const previewRef = useRef<HTMLCanvasElement | null>(null);
@@ -225,13 +235,17 @@ export default function App() {
       const seconds = lane.laneLen / slopeFit.slopePxPerSec / SPEED_CALIBRATION;
       const speed = releaseSpeedFromSeconds(seconds);
 
-      // clean fitted trajectory in LANE coordinates, so depth=0 lands exactly on the foul line
+      // clean fitted trajectory as an image-space line, clipped to the clicked foul + arrows edges
       const depths = rolling.map((s) => s.depthPx);
       const laterals = rolling.map((s) => lane.signedLateral({ x: s.x, y: s.y }));
       const latFit = linreg(depths, laterals);
       if (latFit) {
-        const foulPt = lane.toImage(0, latFit.b); // on the foul line
-        const arrowPt = lane.toImage(lane.laneLen, latFit.m * lane.laneLen + latFit.b);
+        // P(depth) = O + depth*D  (affine in depth, so a straight image line)
+        const O = { x: lane.nearMid.x + latFit.b * lane.normal.x, y: lane.nearMid.y + latFit.b * lane.normal.y };
+        const D = { x: lane.downlane.x + latFit.m * lane.normal.x, y: lane.downlane.y + latFit.m * lane.normal.y };
+        const foulPt = lineIntersect(O, D, points[0], points[1]) ?? lane.toImage(0, latFit.b);
+        const arrowPt =
+          lineIntersect(O, D, points[2], points[3]) ?? lane.toImage(lane.laneLen, latFit.m * lane.laneLen + latFit.b);
         dctx.strokeStyle = "rgba(0,225,255,1)";
         dctx.lineWidth = 4;
         dctx.beginPath();
@@ -240,7 +254,7 @@ export default function App() {
         dctx.stroke();
         dctx.fillStyle = "red";
         dctx.beginPath();
-        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // sits on the foul line
+        dctx.arc(foulPt.x, foulPt.y, 6, 0, 2 * Math.PI); // on the clicked foul line
         dctx.fill();
       }
 

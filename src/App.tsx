@@ -183,8 +183,13 @@ export default function App() {
         await new Promise((r) => requestAnimationFrame(() => r(null)));
       });
 
-      // --- speed from a line fit over the 15 ft window (robust; extrapolates to the foul line) ---
-      const windowSamples = track.path.filter((s) => s.depthPx >= 0 && s.depthPx <= lane.laneLen);
+      // --- speed from a line fit over the ROLLING part of the 15 ft window ---
+      // Skip the first stretch: right after release the ball is lofted above the lane,
+      // which biases its projected depth. Fit the settled roll and extrapolate to the foul line.
+      const FIT_START_FRAC = 0.2; // raise if you loft more (speed reads low); lower if it reads high
+      const windowSamples = track.path.filter(
+        (s) => s.depthPx >= FIT_START_FRAC * lane.laneLen && s.depthPx <= lane.laneLen
+      );
       const fit = fitDepthSlope(windowSamples);
       console.log("[app] path", track.path.length, "windowN", windowSamples.length, "fit", fit);
 
